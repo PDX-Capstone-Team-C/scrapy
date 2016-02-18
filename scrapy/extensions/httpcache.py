@@ -1,13 +1,16 @@
 from __future__ import print_function
 import os
 import gzip
+import zlib
+from io import BytesIO
+from scrapy.utils.gz import gunzip, is_gzipped
 from six.moves import cPickle as pickle
 from importlib import import_module
 from time import time
 from weakref import WeakKeyDictionary
 from email.utils import mktime_tz, parsedate_tz
 from w3lib.http import headers_raw_to_dict, headers_dict_to_raw
-from scrapy.http import Headers, Response
+from scrapy.http import Headers, Response, TextResponse
 from scrapy.responsetypes import responsetypes
 from scrapy.utils.request import request_fingerprint
 from scrapy.utils.project import data_path
@@ -387,10 +390,12 @@ class DeltaLeveldbCacheStorage(object):
             return
         data = self._deserialize(serial_response)
         response = self._reconstruct_response(data)
+        response = self._recompress(response)
         return response
 
     def store_response(self, spider, request, response):
         target_key = self._request_key(request)
+        response = self._decompress(response)
         target_response = self._serialize(response)
         # use this to control if we write a length or not
         original_length = None
@@ -483,6 +488,37 @@ class DeltaLeveldbCacheStorage(object):
 
     def _deserialize(self, serial_response):
         return pickle.loads(serial_response)
+
+    def _recompress(self, response):
+        content_encoding = response.headers.getlist('Content-Encoding')
+        if content_encoding and not is_gzipped(response):
+            encoding = content_encoding[-1]
+            if encoding.lower() == b'gzip' or encoding.lower() == b'x-gzip':
+                buffer = BytesIO()
+                with gzip.GzipFile(mode='wb', fileobj=buffer) as f:
+                    f.write(response.body)
+                    f.close()
+                encoded_body = buffer.getvalue()
+            if encoding.lower() == b'deflate':
+                encoded_body = zlib.compress(response.body)
+            kwargs = dict(body=encoded_body)
+            response = response.replace(**kwargs)
+        return response
+
+    def _decompress(self, response):
+        content_encoding = response.headers.getlist('Content-Encoding')
+        if content_encoding and not is_gzipped(response):
+            encoding = content_encoding[-1]
+            if encoding.lower() == b'gzip' or encoding.lower() == b'x-gzip':
+                decoded_body = gunzip(response.body)
+            if encoding.lower() == b'deflate':
+                try:
+                    decoded_body = zlib.decompress(response.body)
+                except zlib.error:
+                    decoded_body = zlib.decompress(response.body, -15)
+            kwargs = dict(body=decoded_body)
+            response = response.replace(**kwargs)
+        return response
 
     # We can use this when we already have a key ahead of time,
     # i.e. grabbing sources by IP/domain, grabbing a source response.
